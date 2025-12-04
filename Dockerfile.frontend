@@ -1,0 +1,29 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copier .npmrc pour proxy corporate + registry override
+COPY .npmrc ./
+
+# Copier package.json
+COPY package*.json ./
+
+# Clear localhost proxy résiduel
+RUN npm config delete proxy
+RUN npm config delete https-proxy
+
+# Install (via .npmrc corporate proxy, ignore localhost:5000)
+RUN npm install
+
+# Copier code source
+COPY . .
+
+# Build React
+RUN npm run build
+
+# Serve statique
+RUN npm install -g serve
+
+EXPOSE 3000
+
+CMD ["serve", "-s", "build", "-l", "3000"]

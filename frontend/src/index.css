@@ -1,0 +1,23 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Fond global qui suit le thème */
+html {
+  @apply bg-gray-50 text-gray-900 transition-colors duration-300;
+}
+
+html.dark {
+  @apply bg-gradient-to-br from-slate-900 via-emerald-950 to-slate-900 text-gray-100;
+}
+
+/* Optionnel : améliore les inputs en light mode */
+input, select, textarea {
+  @apply transition-colors duration-200;
+}
+
+html:not(.dark) input,
+html:not(.dark) select,
+html:not(.dark) textarea {
+  @apply bg-white/90 text-gray-900 placeholder-gray-500;
+}

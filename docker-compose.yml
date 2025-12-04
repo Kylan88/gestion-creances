@@ -1,0 +1,49 @@
+# version: '3.8'
+
+services:
+  backend:
+    platform: linux/amd64  # Ajoutez ça
+    build:
+      context: ./backend  # Chemin vers dossier backend
+      dockerfile: ../Dockerfile.backend
+    ports:
+      - "5000:5000"  # Accès local: votre_IP:5000
+    environment:
+      - FLASK_ENV=development
+      - SECRET_KEY=votre_secret_key_ici  # Copiez de .env
+      # Ajoutez d'autres vars .env ici (SMTP, Twilio, etc.)
+    volumes:
+      - ./backend:/app  # Pour hot reload en dev
+    #depends_on:
+    #  - db  # Si vous migrez DB plus tard
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:5000  # Proxy React vers votre backend app.py (pour /api routes)
+      - HTTP_PROXY=http://10.144.195.61:8080  # Corporate proxy pour npm/Docker
+      - HTTPS_PROXY=http://10.144.195.61:8080
+      - NO_PROXY=localhost,127.0.0.1  # Ignore localhost:5000 pour éviter ECONNREFUSED
+    volumes:
+      - ./frontend:/app
+    depends_on:
+      - backend
+
+  # Optionnel : DB PostgreSQL pour remplacer SQLite (partagée)
+  #db:
+  #  image: postgres:15
+  #  environment:
+  #    POSTGRES_DB: clients_db
+  #    POSTGRES_USER: user
+  #    POSTGRES_PASSWORD: password
+  #  ports:
+  #    - "5432:5432"
+  #  volumes:
+  #    - postgres_data:/var/lib/postgresql/data
+
+#volumes:
+  #postgres_data:

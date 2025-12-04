@@ -1,0 +1,26 @@
+# Fallback non-slim pour Pillow full support (voir plus bas)
+FROM python:3.12
+
+# Si slim : Installe libs (gardez pour test)
+# RUN apt-get update && apt-get install -y \
+#     libjpeg62-turbo-dev \  # Runtime pour JPEG
+#     libpng-dev \
+#     libwebp-dev \  # WebP si besoin
+#     zlib1g-dev \
+#     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Test import PIL pendant build (pour debug)
+RUN python -c "from PIL import Image; print('PIL imported successfully - ready for app.py avatar upload')"
+
+COPY . .
+
+RUN mkdir -p static/uploads/avatars
+
+EXPOSE 5000
+
+CMD ["python", "app.py"]

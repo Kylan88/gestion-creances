@@ -1,0 +1,1847 @@
+import logging
+import os
+import random
+from dotenv import load_dotenv
+from flask_cors import CORS
+import secrets
+logging.basicConfig(level=logging.DEBUG)
+
+from flask import Flask, request, session, jsonify, make_response
+import sqlite3
+from email_validator import validate_email, EmailNotValidError
+import uuid
+from werkzeug.utils import secure_filename
+from PIL import Image
+import bcrypt
+from functools import wraps
+from datetime import datetime, date, timezone, timedelta
+from twilio.rest import Client 
+import smtplib
+from email.mime.text import MIMEText
+import schedule
+import time
+import threading
+from flask_wtf.csrf import CSRFProtect, generate_csrf, CSRFError
+from flask_socketio import SocketIO, emit
+import csv
+import io
+import phonenumbers
+from phonenumbers import geocoder
+
+# Charger les variables d'environnement
+load_dotenv()
+
+# Configuration Flask
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(16))  # Fallback si .env absent
+socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+                    logger=True, engineio_logger=True, transports=['websocket', 'polling'])
+
+# Configuration CORS pour toutes les routes
+CORS(app, resources={
+    r"/*": {  # AJOUT : Catch-all pour toutes routes, incluant /forgot-password
+        "origins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-CSRF-Token", "Authorization"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": True,
+        "always_send_headers": True  # AJOUT : Force en-têtes même sur erreurs (fix 400 sans CORS)
+    }
+}, supports_credentials=True)
+
+
+DB_PATH = "clients.db"
+csrf = CSRFProtect(app)
+# Si la version de flask_wtf n'expose pas csrf.exempt comme décorateur, fournir un fallback
+if not hasattr(csrf, 'exempt'):
+    # csrf.exempt(view_func) devrait fonctionner ; on fournit un fallback décorateur no-op
+    def _exempt(f):
+        return f
+    csrf.exempt = _exempt
+
+# Configuration SMTP
+SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+SMTP_USER = os.getenv('SMTP_USER', 'ton.email@gmail.com')
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', 'mot-de-passe-d-application')
+
+# Configuration Twilio pour SMS (vers ligne 40, après SMTP)
+TWILIO_SID = os.getenv('TWILIO_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE = os.getenv('TWILIO_PHONE')  # e.g., '+1234567890'
+
+if not all([TWILIO_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE]):
+    logging.warning("Variables Twilio manquantes ; les SMS ne fonctionneront pas.")
+
+# DB connection
+def get_db_connection():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logging.error(f"Erreur de connexion à la base de données : {str(e)}")
+        raise
+
+# Liste des pays pour le menu déroulant
+def get_country_list():
+    countries = []
+    for region_code in phonenumbers.SUPPORTED_REGIONS:
+        try:
+            country_code = phonenumbers.country_code_for_region(region_code)
+            # la description peut nécessiter un numéro complet ; on construit un parse minimal
+            try:
+                num = phonenumbers.parse(f"+{country_code}", region_code)
+                country_name = geocoder.description_for_number(num, "fr")
+            except Exception:
+                country_name = region_code
+            countries.append((region_code, f"{country_name} (+{country_code})"))
+        except Exception:
+            continue
+    # retirer doublons et trier par nom
+    unique = list({c[0]: c for c in countries}.values())
+    return sorted(unique, key=lambda x: x[1])
+
+# Login required decorator
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            response = make_response(jsonify({"error": "Veuillez vous connecter."}), 401)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+        return f(*args, **kwargs)
+    return decorated
+
+# Admin required decorator
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if session.get("role") != "admin":
+            response = make_response(jsonify({"error": "Accès réservé aux administrateurs."}), 403)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+        return f(*args, **kwargs)
+    return decorated
+
+# Historique helper
+def enregistrer_historique(conn, client_id, action, modifie_par, details=""):
+    try:
+        date_modif = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO historique (client_id, action, modifie_par, date_modification, details) VALUES (?, ?, ?, ?, ?)",
+            (client_id, action, modifie_par, date_modif, details)
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Erreur lors de l'enregistrement dans l'historique : {str(e)}")
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg', 'gif'}
+
+# UPLOAD_FOLDER (crée le dossier si besoin)
+UPLOAD_FOLDER = os.path.join(app.static_folder, 'uploads/avatars')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Email relance helper
+def envoyer_relance_email(client):
+    msg = MIMEText(
+        f"Bonjour {client['nom']},\n\n"
+        f"Nous vous rappelons que vous avez un montant dû de {float(client['montant_du']):.2f} FCFA, "
+        f"échue le {client['date_echeance']}.\n"
+        f"Veuillez effectuer le paiement dès que possible.\n\n"
+        f"Cordialement,\nÉquipe Recouvrement"
+    )
+    msg["Subject"] = "Rappel : Paiement en retard"
+    msg["From"] = SMTP_USER
+    msg["To"] = client["email"]
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        socketio.emit('notification', {
+            'message': f"Relance automatique envoyée à {client['nom']} ({client['email']})"
+        })
+        return True
+    except Exception as e:
+        logging.error(f"Erreur envoi email : {e}")
+        return False
+
+# Tâche planifiée pour relances automatiques
+def relance_automatique():
+    try:
+        with get_db_connection() as conn:
+            clients = conn.execute(
+                "SELECT * FROM clients WHERE date_echeance < ? AND montant_du > 0",
+                (date.today().isoformat(),)
+            ).fetchall()
+            for client in clients:
+                if envoyer_relance_email(dict(client)):
+                    enregistrer_historique(
+                        conn, client["id"], "relance_auto", "system",
+                        f"Relance automatique envoyée à {client['nom']}"
+                    )
+                    logging.info(f"Relance envoyée à {client['nom']} ({client['email']})")
+    except Exception as e:
+        logging.error(f"Erreur dans relance_automatique : {str(e)}")
+
+# Lancer le scheduler dans un thread séparé
+def run_scheduler():
+    try:
+        schedule.every().day.at("08:00").do(relance_automatique)
+    except Exception as e:
+        logging.error(f"Erreur lors de l'initialisation du scheduler: {e}")
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logging.error(f"Erreur dans le scheduler lors de run_pending: {e}")
+        time.sleep(60)
+
+# Enregistrer connexion/déconnexion
+def enregistrer_connexion(user_id, action):
+    try:
+        with get_db_connection() as conn:
+            date_action = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO connexions (user_id, action, date_action) VALUES (?, ?, ?)",
+                (user_id, action, date_action)
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Erreur lors de l'enregistrement de la connexion : {str(e)}")
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    logging.warning(f"CSRF Error: {e.description}")
+    return "Erreur CSRF: token invalide ou manquant", 400
+
+@app.before_request
+def handle_options():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-CSRF-Token'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/api/csrf_token', methods=['GET'])
+def get_csrf_token():
+    try:
+        token = generate_csrf()
+        session['csrf_token'] = token  # Stocker le jeton dans la session
+        response = make_response(jsonify({"csrf_token": token}))
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.set_cookie('csrf_token', token, httponly=True, samesite='Lax')
+        return response
+    except Exception as e:
+        logging.error(f"Erreur lors de la génération du jeton CSRF : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la génération du jeton CSRF."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+# Helper pour envoyer email de reset password
+def envoyer_reset_email(user, token):
+    reset_link = f"http://localhost:3000/reset-password?token={token}"
+    msg = MIMEText(
+        f"Bonjour {user['fullname']},\n\n"
+        f"Vous avez demandé une réinitialisation de mot de passe.\n"
+        f"Cliquez sur le lien suivant pour réinitialiser votre mot de passe :\n{reset_link}\n\n"
+        f"Ce lien expire dans 1 heure.\n\n"
+        f"Si vous n'avez pas demandé cela, ignorez cet email.\n\n"
+        f"Cordialement,\nÉquipe"
+    )
+    msg["Subject"] = "Réinitialisation de mot de passe"
+    msg["From"] = SMTP_USER
+    msg["To"] = user["email"]
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        logging.info(f"Email reset envoyé à {user['email']} (token: {token[:8]}...)")  # LOG SUCCÈS
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        logging.error(f"SMTP Auth fail (535) : {str(e)}. Vérifiez App Password dans .env.")
+        return False
+    except Exception as e:
+        logging.error(f"Erreur envoi email reset à {user['email']} : {str(e)}")
+        return False
+
+# Helper pour envoyer SMS de reset password
+def envoyer_reset_sms(phone, code):
+    if not all([TWILIO_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE]):
+        logging.error("Configuration Twilio incomplète")
+        return False
+    try:
+        # AJOUT : Check préventif pour éviter 21266
+        if phone == TWILIO_PHONE:
+            logging.warning(f"Auto-envoi détecté (To={phone} == From={TWILIO_PHONE}). Skip SMS.")
+            return False  # Fallback : Ne renvoie pas False hard, mais log et continue (ou fallback email si user a une adresse email)
+        
+        client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=f"Votre code de réinitialisation de mot de passe est : {code}. Il expire dans 1 heure.",
+            from_=TWILIO_PHONE,
+            to=phone
+        )
+        logging.info(f"SMS envoyé : {message.sid} (To: {phone}, From: {TWILIO_PHONE})")
+        return True
+    except Exception as e:
+        if "21266" in str(e):  # AJOUT : Catch spécifique Twilio same number
+            logging.error(f"Twilio 21266 : To/From identiques ({phone} == {TWILIO_PHONE}). Changez TWILIO_PHONE dans .env.")
+        else:
+            logging.error(f"Erreur envoi SMS à {phone} : {str(e)}")
+        return False
+    
+# Route login
+@app.route('/login', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def login():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-CSRF-Token, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            response = make_response(jsonify({"error": "Nom d'utilisateur et mot de passe requis."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        username = data['username']
+        password = data['password'].encode('utf-8')
+
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            if not user or not bcrypt.checkpw(password, user['password'].encode('utf-8')):
+                response = make_response(jsonify({"error": "Nom d'utilisateur ou mot de passe incorrect."}), 401)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['role'] = user['role']
+            session.permanent = True  # Session persistante
+            enregistrer_connexion(user['id'], 'login')
+
+            response = make_response(jsonify({
+                "message": "Connexion réussie.",
+                "user": {"id": user['id'], "username": user['username'], "role": user['role']}
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except Exception as e:
+        logging.error(f"Erreur lors de la connexion : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la connexion."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/register', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def register():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-CSRF-Token, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    try:
+        data = request.get_json()
+        if not data or not all(key in data for key in ['username', 'fullname', 'email', 'telephone', 'password', 'confirm_password']):
+            response = make_response(jsonify({"error": "Champs incomplets (username, fullname, email, telephone, password, confirm_password requis)."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        username = data['username']
+        fullname = data['fullname']
+        email = data['email']
+        telephone = data['telephone'].strip()  # NOUVEAU : Extraction et strip
+        password = data['password'].encode('utf-8')
+        confirm_password = data['confirm_password'].encode('utf-8')
+
+        if password != confirm_password:
+            response = make_response(jsonify({"error": "Les mots de passe ne correspondent pas."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        try:
+            validate_email(email, check_deliverability=False)
+        except EmailNotValidError:
+            response = make_response(jsonify({"error": "Email invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        # NOUVEAU : Validation et normalisation du téléphone
+        if telephone.startswith("+"):
+            parsed_phone = phonenumbers.parse(telephone, None)
+        elif telephone.startswith("225") and len(telephone) == 12:
+            parsed_phone = phonenumbers.parse("+" + telephone, None)
+        elif len(telephone) == 10 and telephone.isdigit():
+            parsed_phone = phonenumbers.parse("+225" + telephone, None)  # Assume Côte d'Ivoire (+225)
+        else:
+            response = make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        if not phonenumbers.is_valid_number(parsed_phone):
+            response = make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        phone_normalized = phonenumbers.format_number(parsed_phone, phonenumbers.PhoneNumberFormat.E164)
+
+        with get_db_connection() as conn:
+            # NOUVEAU : Check existing sur email ET téléphone
+            existing_user = conn.execute("SELECT * FROM users WHERE username = ? OR email = ? OR telephone = ?",
+                                         (username, email, phone_normalized)).fetchone()
+            if existing_user:
+                response = make_response(jsonify({"error": "Username, email ou téléphone déjà utilisé."}), 409)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            hashed_password = bcrypt.hashpw(password, bcrypt.gensalt()).decode('utf-8')
+            conn.execute(
+                "INSERT INTO users (username, fullname, email, telephone, password, role) VALUES (?, ?, ?, ?, ?, 'user')",
+                (username, fullname, email, phone_normalized, hashed_password)  # NOUVEAU : Ajout telephone
+            )
+            conn.commit()
+            user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            # Auto-login après register (optionnel, ou redirige à login)
+            session['user_id'] = user_id
+            session['username'] = username
+            session['role'] = 'user'
+            enregistrer_connexion(user_id, 'login')
+
+            response = make_response(jsonify({
+                "message": "Compte créé et connecté avec succès.",
+                "user": {"id": user_id, "username": username, "role": "user", "telephone": phone_normalized}  # NOUVEAU : Inclut telephone dans réponse
+            }), 201)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except Exception as e:
+        logging.error(f"Erreur lors de l'inscription : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la création du compte."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+#  Route pour mot de passe oublié
+@app.route('/forgot-password', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def forgot_password():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-CSRF-Token'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        logging.info("OPTIONS /forgot-password OK")  # DEBUG : Log preflight
+        return response
+
+    logging.info(f"Forgot: Requête POST reçue, body: {request.get_data(as_text=True)}")  # DEBUG : Log body JSON
+
+    try:
+        data = request.get_json()
+        logging.info(f"Forgot: JSON parsé: {data}")  # DEBUG : Log data
+        if not data or 'identifier' not in data:
+            logging.warning("Forgot: 400 - Pas d'identifier")  # DEBUG
+            return make_response(jsonify({"error": "Identifiant (email ou téléphone) requis."}), 400)
+
+        identifier = data['identifier'].strip()
+
+        with get_db_connection() as conn:
+            user = None
+            is_email = '@' in identifier
+            if is_email:
+                try:
+                    validate_email(identifier, check_deliverability=False)
+                    user = conn.execute("SELECT * FROM users WHERE email = ?", (identifier,)).fetchone()
+                except EmailNotValidError:
+                    return make_response(jsonify({"error": "Email invalide."}), 400)
+            else:
+                # Traiter comme téléphone
+                try:
+                    parsed_phone = phonenumbers.parse(identifier, None)
+                    if not phonenumbers.is_valid_number(parsed_phone):
+                        return make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+                    phone_normalized = phonenumbers.format_number(parsed_phone, phonenumbers.PhoneNumberFormat.E164)
+                    user = conn.execute("SELECT * FROM users WHERE telephone = ?", (phone_normalized,)).fetchone()
+                except phonenumbers.NumberParseException:
+                    return make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+
+            if not user:
+                return make_response(jsonify({"error": "Identifiant non trouvé."}), 404)
+
+            # Supprimer anciens tokens expirés
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            token = str(uuid.uuid4())
+            code = ''.join([str(random.randint(0, 9)) for _ in range(6)])  # Code 6 chiffres pour SMS
+
+            # Stocker token et code (pour email, on utilise token ; pour SMS, code)
+            conn.execute(
+                "INSERT INTO password_resets (user_id, token, code, expires_at) VALUES (?, ?, ?, ?)",
+                (user['id'], token, code if not is_email else None, expires_at)
+            )
+            conn.commit()
+
+            sent = False
+            if is_email:
+                sent = envoyer_reset_email(dict(user), token)
+                method = "email"
+            else:
+                phone = user['telephone']
+                sent = envoyer_reset_sms(phone, code)
+                method = "SMS"
+
+            if sent:
+                logging.info(f"Reset demandé pour {user['username']} via {method}")
+                return make_response(jsonify({"message": f"Lien/code de réinitialisation envoyé via {method}."}), 200)
+            else:
+                logging.warning(f"Forgot fail pour {user['username']} par {method} : Envoi échoué, mais token généré.")
+                response_data = {"message": f"Token généré pour reset (envoi {method} échoué : vérifiez config SMTP/Twilio).", "token": token}
+                return make_response(jsonify(response_data), 400)
+
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /forgot-password : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+    except Exception as e:
+        logging.error(f"Erreur générale /forgot-password : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+
+# NOUVEAU : Route pour réinitialiser le mot de passe
+@app.route('/reset-password', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def reset_password():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-CSRF-Token'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    try:
+        data = request.get_json()
+        if not data or 'token' not in data or 'new_password' not in data or 'confirm_password' not in data:
+            return make_response(jsonify({"error": "Token, new_password et confirm_password requis."}), 400)
+
+        if data['new_password'] != data['confirm_password']:
+            return make_response(jsonify({"error": "Les mots de passe ne correspondent pas."}), 400)
+
+        token = data['token']
+        new_password = data['new_password'].encode('utf-8')
+
+        with get_db_connection() as conn:
+            reset = conn.execute(
+                "SELECT * FROM password_resets pr JOIN users u ON pr.user_id = u.id "
+                "WHERE pr.token = ? AND pr.expires_at > ?",
+                (token, datetime.now(timezone.utc).isoformat())
+            ).fetchone()
+
+            if not reset:
+                return make_response(jsonify({"error": "Token invalide ou expiré."}), 400)
+
+            hashed_password = bcrypt.hashpw(new_password, bcrypt.gensalt()).decode('utf-8')
+            conn.execute("UPDATE users SET password = ? WHERE id = ?", (hashed_password, reset['id']))
+            conn.execute("DELETE FROM password_resets WHERE token = ?", (token,))
+            conn.commit()
+
+            logging.info(f"Mot de passe réinitialisé pour {reset['username']}")
+            return make_response(jsonify({"message": "Mot de passe réinitialisé avec succès. Vous pouvez maintenant vous connecter."}), 200)
+
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /reset-password : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+    except Exception as e:
+        logging.error(f"Erreur générale /reset-password : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+    
+            # Migration pour telephone si pas de colonne
+    try:
+                conn.execute("SELECT telephone FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE users ADD COLUMN telephone TEXT UNIQUE")
+                conn.commit()
+                logging.info("Migration : Colonne telephone ajoutée.")
+                
+@app.route('/logout', methods=['POST'])
+@login_required
+@csrf.exempt
+def logout():
+    try:
+        user_id = session['user_id']
+        username = session['username']
+        session.clear()
+        enregistrer_connexion(user_id, 'logout')
+        socketio.emit('notification', {
+            'message': f"Déconnexion de l'utilisateur {username}"
+        })
+        response = make_response(jsonify({"message": "Déconnexion réussie."}), 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    except Exception as e:
+        logging.error(f"Erreur lors de la déconnexion : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la déconnexion."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/api/user', methods=['GET'])
+@login_required
+def get_user():
+    try:
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT id, username, fullname, email, role, avatar_url FROM users WHERE id = ?",
+                                (session['user_id'],)).fetchone()
+            if not user:
+                response = make_response(jsonify({"error": "Utilisateur non trouvé."}), 404)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+            response = make_response(jsonify({"user": dict(user)}), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /api/user : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+
+@app.route('/profil', methods=['GET', 'POST'])
+@login_required
+@csrf.exempt  # Exempt CSRF pour API POST
+def profil():
+    try:
+        with get_db_connection() as conn:
+            user = conn.execute("SELECT id, username, fullname, email, avatar_url, role FROM users WHERE id = ?",
+                                (session['user_id'],)).fetchone()
+
+            if request.method == 'GET':
+                response = make_response(jsonify(dict(user)), 200)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            elif request.method == 'POST':
+                # FIX : Détecte multipart pour upload_avatar avant JSON
+                if 'avatar' in request.files:
+                    # Gère upload directement (pas besoin d'action)
+                    file = request.files['avatar']
+                    if file.filename == '':
+                        response = make_response(jsonify({"error": "Aucun fichier sélectionné."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                    if file and allowed_file(file.filename):
+                        # Refetch user pour avatar_url frais
+                        user = conn.execute("SELECT avatar_url FROM users WHERE id = ?", (session['user_id'],)).fetchone()
+
+                        # Unique filename avec UUID
+                        filename = str(uuid.uuid4()) + '.' + secure_filename(file.filename).rsplit('.', 1)[1].lower()
+                        filepath = os.path.join(UPLOAD_FOLDER, filename)
+
+                        # Optionnel : Resize image (max 200x200)
+                        file.stream.seek(0)  # Reset stream après check
+                        image = Image.open(file.stream)
+                        image.thumbnail((200, 200))
+                        image.save(filepath, optimize=True, quality=85)
+
+                        # Update DB avec avatar_url
+                        avatar_url = f"/static/uploads/avatars/{filename}"
+                        conn.execute("UPDATE users SET avatar_url = ? WHERE id = ?",
+                                     (avatar_url, session['user_id']))
+                        conn.commit()
+
+                        # Supprime ancien avatar si existant (optionnel)
+                        if user and user['avatar_url']:
+                            old_filename = user['avatar_url'].split('/')[-1]
+                            old_path = os.path.join(UPLOAD_FOLDER, old_filename)
+                            if os.path.exists(old_path):
+                                os.remove(old_path)
+
+                        response = make_response(jsonify({"message": "Avatar mis à jour.", "avatar_url": avatar_url}), 200)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+                    else:
+                        response = make_response(jsonify({"error": "Format de fichier non autorisé (JPG, PNG, GIF)."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                # Sinon, c'est JSON pour les autres actions
+                data = request.get_json()
+                if not data:
+                    response = make_response(jsonify({"error": "Données invalides."}), 400)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                action = data.get('action')
+                if not action:
+                    response = make_response(jsonify({"error": "Action requise."}), 400)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                if action == 'update_info':
+                    try:
+                        validate_email(data['email'], check_deliverability=False)
+                    except EmailNotValidError:
+                        response = make_response(jsonify({"error": "Email invalide."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                    conn.execute("UPDATE users SET fullname = ?, email = ? WHERE id = ?",
+                                 (data['fullname'], data['email'], session['user_id']))
+                    conn.commit()
+                    response = make_response(jsonify({"message": "Informations mises à jour."}), 200)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                elif action == 'change_username':
+                    existing_user = conn.execute("SELECT * FROM users WHERE username = ? AND id != ?",
+                                                 (data['new_username'], session['user_id'])).fetchone()
+                    if existing_user:
+                        response = make_response(jsonify({"error": "Nom d'utilisateur déjà utilisé."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                    conn.execute("UPDATE users SET username = ? WHERE id = ?",
+                                 (data['new_username'], session['user_id']))
+                    session['username'] = data['new_username']
+                    conn.commit()
+                    # FIX : Retire broadcast=True (non supporté) ; emit to all par défaut
+                    socketio.emit('notification', {
+                        'message': f"Changement de nom d'utilisateur pour {session['username']}"
+                    })  # Sans broadcast= , c'est broadcast par défaut
+                    response = make_response(jsonify({"message": "Nom d'utilisateur mis à jour."}), 200)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                elif action == 'change_password':
+                    user_pw = conn.execute("SELECT password FROM users WHERE id = ?",
+                                           (session['user_id'],)).fetchone()
+                    if not bcrypt.checkpw(data['current_password'].encode('utf-8'), user_pw['password'].encode('utf-8')):
+                        response = make_response(jsonify({"error": "Mot de passe actuel incorrect."}), 401)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                    if data['new_password'] != data['confirm_password']:
+                        response = make_response(jsonify({"error": "Les mots de passe ne correspondent pas."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                    hashed_password = bcrypt.hashpw(data['new_password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                    conn.execute("UPDATE users SET password = ? WHERE id = ?",
+                                 (hashed_password, session['user_id']))
+                    conn.commit()
+                    # FIX : Retire broadcast=True
+                    socketio.emit('notification', {
+                        'message': f"Changement de mot de passe pour {session['username']}"
+                    })  # Sans broadcast=
+                    response = make_response(jsonify({"message": "Mot de passe mis à jour."}), 200)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                # NOUVEAU : Remove Avatar (JSON)
+                elif action == 'remove_avatar':
+                    # Refetch user pour avatar_url frais
+                    user = conn.execute("SELECT avatar_url FROM users WHERE id = ?", (session['user_id'],)).fetchone()
+                    if user and user['avatar_url']:
+                        old_filename = user['avatar_url'].split('/')[-1]
+                        old_path = os.path.join(UPLOAD_FOLDER, old_filename)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+                        conn.execute("UPDATE users SET avatar_url = NULL WHERE id = ?",
+                                     (session['user_id'],))
+                        conn.commit()
+                        response = make_response(jsonify({"message": "Avatar supprimé."}), 200)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+                    else:
+                        response = make_response(jsonify({"error": "Aucun avatar à supprimer."}), 400)
+                        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                        response.headers['Access-Control-Allow-Credentials'] = 'true'
+                        return response
+
+                response = make_response(jsonify({"error": "Action non reconnue."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /profil : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    except Exception as e:
+        logging.error(f"Erreur inattendue dans /profil : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/api/clients', methods=['GET'])
+@login_required
+def get_clients():
+    try:
+        with get_db_connection() as conn:
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 10))
+            search = request.args.get('search', '')
+            statut = request.args.get('statut', 'tous')
+            montant_min = request.args.get('montant_min', None)
+            montant_max = request.args.get('montant_max', None)
+
+            # AJOUTÉ : Filtre par created_by si non-admin
+            created_by_filter = ""
+            params = []
+            if session.get('role') != 'admin':
+                created_by_filter = "AND created_by = ?"
+                params.append(session['username'])
+
+            # Construire clause WHERE et params réutilisables
+            base_from = f"FROM clients WHERE 1=1 {created_by_filter}"
+            where_clauses = []
+            if search:
+                where_clauses.append("AND nom LIKE ?")
+                params.append(f"%{search}%")
+
+            if statut != 'tous':
+                today = date.today().isoformat()
+                if statut == 'retard':
+                    where_clauses.append("AND date_echeance < ?")
+                    params.append(today)
+                elif statut == 'avenir':
+                    where_clauses.append("AND date_echeance >= ?")
+                    params.append(today)
+
+            if montant_min:
+                where_clauses.append("AND montant_du >= ?")
+                params.append(float(montant_min))
+            if montant_max:
+                where_clauses.append("AND montant_du <= ?")
+                params.append(float(montant_max))
+
+            where_sql = " ".join(where_clauses)
+            count_query = f"SELECT COUNT(*) {base_from} {where_sql}"
+            total = conn.execute(count_query, params).fetchone()[0]
+            total_pages = (total + per_page - 1) // per_page
+
+            query = f"SELECT * {base_from} {where_sql} ORDER BY nom LIMIT ? OFFSET ?"
+            params_for_query = params + [per_page, (page - 1) * per_page]
+
+            clients = conn.execute(query, params_for_query).fetchall()
+            response = make_response(jsonify({
+                "clients": [dict(client) for client in clients],
+                "total_pages": total_pages
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /api/clients : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la récupération des clients."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/clients/add', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def add_client():
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-CSRF-Token'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    if "user_id" not in session:
+        response = make_response(jsonify({"error": "Veuillez vous connecter."}), 401)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    logging.debug(f"Données reçues: {request.get_json()}")
+
+    try:
+        data = request.get_json()
+        if not data or not all(key in data for key in ['nom', 'telephone', 'email', 'montant_du', 'date_echeance']):
+            logging.error(f"Données reçues invalides: {data}")
+            return make_response(jsonify({"error": "Données incomplètes ou invalides."}), 400)
+
+        try:
+            # Vérification email
+            validate_email(data['email'], check_deliverability=False)
+
+            # Vérification numéro
+            phone = data['telephone'].strip()
+
+            if phone.startswith("+"):
+                parsed_phone = phonenumbers.parse(phone, None)
+            elif phone.startswith("225") and len(phone) == 12:
+                parsed_phone = phonenumbers.parse("+" + phone, None)
+            elif len(phone) == 10 and phone.isdigit():
+                parsed_phone = phonenumbers.parse("+225" + phone, None)
+            else:
+                return make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+
+            if not phonenumbers.is_valid_number(parsed_phone):
+                return make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+
+            # Normaliser en format international E.164 (+225xxxxxxx)
+            phone_normalized = phonenumbers.format_number(
+                parsed_phone, phonenumbers.PhoneNumberFormat.E164
+            )
+
+            # Vérification date et montant
+            datetime.strptime(data['date_echeance'], '%Y-%m-%d')
+            montant = float(data['montant_du'])
+            if montant <= 0:
+                return make_response(jsonify({"error": "Le montant dû doit être positif."}), 400)
+
+        except EmailNotValidError:
+            return make_response(jsonify({"error": "Email invalide."}), 400)
+        except phonenumbers.NumberParseException:
+            return make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+        except ValueError:
+            return make_response(jsonify({"error": "Format de date ou montant invalide."}), 400)
+
+        # Insertion en BDD
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO clients (nom, telephone, email, montant_du, date_echeance, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                (data['nom'], phone_normalized, data['email'], montant, data['date_echeance'], session['username'])
+            )
+            conn.commit()
+            client_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            enregistrer_historique(conn, client_id, "ajout", session['username'], f"Nouveau client {data['nom']} ajouté")
+            socketio.emit('notification', {
+                'message': f"Nouveau client {data['nom']} ajouté par {session['username']}"
+            })
+
+            response = make_response(jsonify({"message": "Client ajouté avec succès.", "client_id": client_id}), 201)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/add : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur lors de l'ajout du client."}), 500)
+    except Exception as e:
+        logging.error(f"Erreur générale /clients/add : {e}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+    
+@app.route('/clients/<int:id>', methods=['GET'])
+@login_required
+def get_client(id):
+    try:
+        with get_db_connection() as conn:
+            client = conn.execute("SELECT * FROM clients WHERE id = ?", (id,)).fetchone()
+            if not client:
+                response = make_response(jsonify({"error": "Client non trouvé."}), 404)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            historique = conn.execute("SELECT * FROM historique WHERE client_id = ? ORDER BY date_modification DESC",
+                                     (id,)).fetchall()
+            paiements = conn.execute("SELECT * FROM paiements WHERE client_id = ? ORDER BY date_paiement DESC",
+                                    (id,)).fetchall()
+
+            response = make_response(jsonify({
+                "client": dict(client),
+                "historique": [dict(h) for h in historique],
+                "paiements": [dict(p) for p in paiements]
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/{id} : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/clients/<int:id>/edit', methods=['PUT', 'OPTIONS'])
+@csrf.exempt
+@login_required
+def edit_client(id):
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'PUT, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    if "user_id" not in session:
+        response = make_response(jsonify({"error": "Veuillez vous connecter."}), 401)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    try:
+        data = request.get_json()
+        try:
+            validate_email(data['email'], check_deliverability=False)
+            parsed_phone = phonenumbers.parse(data['telephone'], None)
+            if not phonenumbers.is_valid_number(parsed_phone):
+                response = make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            datetime.strptime(data['date_echeance'], '%Y-%m-%d')
+            float(data['montant_du'])
+        except EmailNotValidError:
+            response = make_response(jsonify({"error": "Email invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+        except phonenumbers.NumberParseException:
+            response = make_response(jsonify({"error": "Numéro de téléphone invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+        except ValueError:
+            response = make_response(jsonify({"error": "Format de date ou montant invalide."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        with get_db_connection() as conn:
+            client = conn.execute("SELECT * FROM clients WHERE id = ?", (id,)).fetchone()
+            if not client:
+                response = make_response(jsonify({"error": "Client non trouvé."}), 404)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            # AJOUTÉ : Check ownership si non-admin
+            if session.get('role') != 'admin' and client['created_by'] != session['username']:
+                response = make_response(jsonify({"error": "Accès non autorisé : ce client ne vous appartient pas."}), 403)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            old_nom = client['nom']
+            conn.execute(
+                "UPDATE clients SET nom = ?, telephone = ?, email = ?, montant_du = ?, date_echeance = ? WHERE id = ?",
+                (data['nom'], data['telephone'], data['email'], data['montant_du'], data['date_echeance'], id)
+            )
+            conn.commit()
+            enregistrer_historique(conn, id, "modification", session['username'],
+                                   f"Modification de {old_nom} vers {data['nom']}")
+            socketio.emit('notification', {
+                'message': f"Client {data['nom']} modifié par {session['username']}"
+            })
+            response = make_response(jsonify({"message": "Client mis à jour."}), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/{id}/edit : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la modification."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/clients/<int:id>/delete', methods=['POST', 'OPTIONS'])
+@login_required
+@csrf.exempt
+def delete_client(id):
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+    try:
+        with get_db_connection() as conn:
+            client = conn.execute("SELECT nom, created_by FROM clients WHERE id = ?", (id,)).fetchone()
+            if not client:
+                response = make_response(jsonify({"error": "Client introuvable."}), 404)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            # AJOUTÉ : Check ownership si non-admin
+            if session.get('role') != 'admin' and client['created_by'] != session['username']:
+                response = make_response(jsonify({"error": "Accès non autorisé : ce client ne vous appartient pas."}), 403)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+            
+            conn.execute("DELETE FROM clients WHERE id = ?", (id,))
+            conn.commit()
+            enregistrer_historique(conn, id, "suppression", session['username'], f"Client {client['nom']} supprimé")
+            socketio.emit('notification', {
+                'message': f"Client {client['nom']} supprimé par {session['username']}"
+            })
+            
+            response = make_response(jsonify({"message": "Client supprimé avec succès."}), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/{id}/delete : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la suppression du client."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/clients/<int:id>/paiement', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def add_payment(id):
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    if "user_id" not in session:
+        response = make_response(jsonify({"error": "Veuillez vous connecter."}), 401)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    try:
+        data = request.get_json()
+        if not data or 'montant' not in data or 'date_paiement' not in data:
+            response = make_response(jsonify({"error": "Données incomplètes."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        montant = float(data['montant'])
+        if montant <= 0:
+            response = make_response(jsonify({"error": "Le montant doit être positif."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        datetime.strptime(data['date_paiement'], '%Y-%m-%d')
+
+        with get_db_connection() as conn:
+            client = conn.execute("SELECT nom, created_by, montant_du FROM clients WHERE id = ?", (id,)).fetchone()
+            if not client:
+                response = make_response(jsonify({"error": "Client introuvable."}), 404)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            # AJOUTÉ : Check ownership si non-admin
+            if session.get('role') != 'admin' and client['created_by'] != session['username']:
+                response = make_response(jsonify({"error": "Accès non autorisé : ce client ne vous appartient pas."}), 403)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            conn.execute(
+                "INSERT INTO paiements (client_id, montant, date_paiement, created_by) VALUES (?, ?, ?, ?)",
+                (id, montant, data['date_paiement'], session['username'])
+            )
+            nouveau_montant = float(client['montant_du']) - montant
+            conn.execute("UPDATE clients SET montant_du = ? WHERE id = ?", (max(0, nouveau_montant), id))
+            conn.commit()
+
+            enregistrer_historique(conn, id, "paiement", session['username'], f"Paiement de {montant} FCFA pour {client['nom']}")
+            socketio.emit('notification', {
+                'message': f"Paiement de {montant} FCFA enregistré pour {client['nom']} par {session['username']}"
+            })
+
+            response = make_response(jsonify({"message": "Paiement enregistré avec succès."}), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except ValueError:
+        response = make_response(jsonify({"error": "Format de date ou montant invalide."}), 400)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/{id}/paiement : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de l'enregistrement du paiement."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/clients/<int:id>/relance', methods=['POST', 'OPTIONS'])
+@csrf.exempt
+def relance_client(id):
+    if request.method == 'OPTIONS':
+        response = make_response('', 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-CSRF-Token'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+    if "user_id" not in session:
+        return make_response(jsonify({"error": "Veuillez vous connecter."}), 401)
+
+    # Vérifier le token CSRF manuellement
+    csrf_token = request.headers.get('X-CSRF-Token')
+    csrf_expected = session.get('csrf_token')
+    if not csrf_token or csrf_token != csrf_expected:
+        logging.warning(f"CSRF Error dans /clients/{id}/relance : reçu={csrf_token}, attendu={csrf_expected}")
+        return make_response(jsonify({"error": "Jeton CSRF invalide."}), 400)
+
+    try:
+        with get_db_connection() as conn:
+            client = conn.execute(
+                "SELECT nom, created_by, email, montant_du, date_echeance FROM clients WHERE id = ?",
+                (id,)
+            ).fetchone()
+
+            if not client:
+                return make_response(jsonify({"error": "Client introuvable."}), 404)
+
+            # AJOUTÉ : Check ownership si non-admin
+            if session.get('role') != 'admin' and client['created_by'] != session['username']:
+                return make_response(jsonify({"error": "Accès non autorisé : ce client ne vous appartient pas."}), 403)
+
+            if float(client['montant_du']) <= 0 or datetime.strptime(client['date_echeance'], '%Y-%m-%d').date() >= date.today():
+                return make_response(jsonify({"error": "Relance non applicable : montant dû nul ou échéance non dépassée."}), 400)
+
+            # Envoi email relance (ton code existant)
+            if envoyer_relance_email(dict(client)):
+                enregistrer_historique(conn, id, "relance", session['username'], f"Relance manuelle envoyée à {client['nom']}")
+                socketio.emit('notification', {
+                    'message': f"Relance envoyée à {client['nom']} par {session['username']}"
+                })
+                response = make_response(jsonify({"message": "Relance envoyée avec succès."}), 200)
+            else:
+                response = make_response(jsonify({"error": "Erreur envoi email relance."}), 500)
+
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /clients/{id}/relance : {str(e)}")
+        return make_response(jsonify({"error": "Erreur serveur lors de l'envoi de la relance."}), 500)
+    except Exception as e:
+        logging.error(f"Erreur générale /clients/{id}/relance : {e}")
+        return make_response(jsonify({"error": "Erreur serveur."}), 500)
+
+@app.route('/api/clients/import', methods=['POST'])
+@login_required
+@csrf.exempt
+def import_clients():
+    try:
+        if 'file' not in request.files:
+            response = make_response(jsonify({"error": "Aucun fichier fourni."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        file = request.files['file']
+        if not file.filename.endswith('.csv'):
+            response = make_response(jsonify({"error": "Le fichier doit être un CSV."}), 400)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+
+        try:
+            # Lecture unique en bytes
+            raw_content = file.read()
+            if not raw_content:
+                logging.error("Fichier CSV vide")
+                response = make_response(jsonify({"error": "Fichier CSV vide ou invalide."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            # Décode avec fallback
+            try:
+                content = raw_content.decode('utf-8')
+                logging.info("Encodage UTF-8 utilisé")
+            except UnicodeDecodeError:
+                try:
+                    content = raw_content.decode('latin-1')
+                    logging.warning("Fallback encodage Latin-1 utilisé pour CSV")
+                except UnicodeDecodeError:
+                    logging.error("Encodage non supporté")
+                    response = make_response(jsonify({"error": "Encodage fichier non supporté (UTF-8 ou Latin-1 requis)."}), 400)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+            # Enlève BOM si présent
+            if content.startswith('\ufeff'):
+                content = content.lstrip('\ufeff')
+
+            if not content.strip():
+                logging.error("Contenu vide après décodage")
+                response = make_response(jsonify({"error": "Contenu CSV vide."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            logging.info(f"Contenu CSV (premiers 200 chars) : {repr(content[:200])}")
+
+            text = io.StringIO(content)
+            reader = csv.DictReader(text)
+            
+            logging.info(f"Colonnes détectées : {reader.fieldnames}")
+            if reader.fieldnames is None:
+                logging.error("Aucune colonne détectée")
+                response = make_response(jsonify({"error": "CSV sans en-tête valide (ajoute 'nom,telephone,email,montant_du,date_echeance' en première ligne)."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            required_columns = {'nom', 'telephone', 'email', 'montant_du', 'date_echeance'}
+            if not required_columns.issubset(set(reader.fieldnames)):
+                logging.error(f"Colonnes manquantes ! Requises: {required_columns}, Détectées: {reader.fieldnames}")
+                response = make_response(jsonify({"error": f"Colonnes manquantes. Nécessaires : {', '.join(required_columns)}. Détectées : {', '.join(reader.fieldnames)}."}), 400)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            # Rewind pour re-parser
+            text.seek(0)
+            reader = csv.DictReader(text)
+
+            success_count = 0
+            error_count = 0
+
+            with get_db_connection() as conn:
+                for row_num, row in enumerate(reader, start=2):
+                    # Skip commentaires (#) ou lignes vides
+                    if not row or str(row.get('nom', '')).strip().startswith('#'):
+                        logging.info(f"Ligne {row_num} ignorée (commentaire ou vide)")
+                        continue
+                    
+                    try:
+                        # Check None/empty pour champs
+                        if not row.get('nom') or row['nom'] is None:
+                            logging.warning(f"Ligne {row_num}: 'nom' manquant/vide")
+                            error_count += 1
+                            continue
+                        if not row.get('telephone') or row['telephone'] is None:
+                            logging.warning(f"Ligne {row_num}: 'telephone' manquant/vide")
+                            error_count += 1
+                            continue
+                        if not row.get('email') or row['email'] is None:
+                            logging.warning(f"Ligne {row_num}: 'email' manquant/vide")
+                            error_count += 1
+                            continue
+                        if row.get('montant_du') is None:
+                            logging.warning(f"Ligne {row_num}: 'montant_du' manquant")
+                            error_count += 1
+                            continue
+                        if not row.get('date_echeance') or row['date_echeance'] is None:
+                            logging.warning(f"Ligne {row_num}: 'date_echeance' manquant/vide")
+                            error_count += 1
+                            continue
+
+                        validate_email(row['email'], check_deliverability=False)
+                        parsed_phone = phonenumbers.parse(str(row['telephone']), None)
+                        if not phonenumbers.is_valid_number(parsed_phone):
+                            logging.warning(f"Ligne {row_num}: Téléphone invalide")
+                            error_count += 1
+                            continue
+
+                        datetime.strptime(row['date_echeance'], '%Y-%m-%d')
+                        montant = float(row['montant_du'])
+                        if montant < 0:
+                            logging.warning(f"Ligne {row_num}: Montant négatif")
+                            error_count += 1
+                            continue
+
+                        conn.execute(
+                            "INSERT INTO clients (nom, telephone, email, montant_du, date_echeance, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+                            (row['nom'], str(row['telephone']), row['email'], montant, row['date_echeance'], session['username'])
+                        )
+                        client_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                        enregistrer_historique(conn, client_id, "import", session['username'],
+                                               f"Client {row['nom']} importé via CSV")
+                        success_count += 1
+                    except (EmailNotValidError, phonenumbers.NumberParseException, ValueError) as row_err:
+                        error_count += 1
+                        logging.warning(f"Ligne {row_num} ignorée (erreur: {str(row_err)}) : {row}")
+                        continue
+                conn.commit()
+
+                socketio.emit('notification', {
+                    'message': f"{success_count} clients importés par {session['username']} ({error_count} erreurs)"
+                })
+                response = make_response(jsonify({
+                    "message": f"{success_count} clients importés avec succès.",
+                    "success_count": success_count,
+                    "error_count": error_count
+                }), 200)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+        except Exception as e:
+            logging.error(f"Erreur lors du traitement du fichier CSV : {str(e)}")
+            response = make_response(jsonify({"error": f"Erreur traitement CSV : {str(e)}."}), 500)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except Exception as e:
+        logging.error(f"Erreur dans /api/clients/import : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de l'importation."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/api/clients/export', methods=['GET'])
+@login_required
+def export_clients():
+    try:
+        with get_db_connection() as conn:
+            search = request.args.get('search', '')
+            statut = request.args.get('statut', 'tous')
+            montant_min = request.args.get('montant_min', None)
+            montant_max = request.args.get('montant_max', None)
+
+            base_from = "FROM clients WHERE 1=1"
+            where_clauses = []
+            params = []
+
+            if search:
+                where_clauses.append("AND nom LIKE ?")
+                params.append(f"%{search}%")
+
+            if statut != 'tous':
+                today = date.today().isoformat()
+                if statut == 'retard':
+                    where_clauses.append("AND date_echeance < ?")
+                    params.append(today)
+                elif statut == 'avenir':
+                    where_clauses.append("AND date_echeance >= ?")
+                    params.append(today)
+
+            if montant_min:
+                where_clauses.append("AND montant_du >= ?")
+                params.append(float(montant_min))
+            if montant_max:
+                where_clauses.append("AND montant_du <= ?")
+                params.append(float(montant_max))
+
+            where_sql = " ".join(where_clauses)
+            query = f"SELECT nom, telephone, email, montant_du, date_echeance {base_from} {where_sql}"
+            clients = conn.execute(query, params).fetchall()
+
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=['nom', 'telephone', 'email', 'montant_du', 'date_echeance'])
+            writer.writeheader()
+            for client in clients:
+                writer.writerow(dict(client))
+
+            response = make_response(output.getvalue())
+            filename = f"clients_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            response.headers['Content-Disposition'] = f'attachment; filename={filename}'
+            response.headers['Content-Type'] = 'text/csv'
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /api/clients/export : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de l'exportation."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/api/historique', methods=['GET'])
+@login_required
+def get_historique():
+    try:
+        with get_db_connection() as conn:
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 10))
+            search_client = request.args.get('search_client', '')
+            action = request.args.get('action', 'tous')
+            date_debut = request.args.get('date_debut', '')
+            date_fin = request.args.get('date_fin', '')
+
+            # Filtre par modifie_par si non-admin
+            user_filter = ""
+            params = []
+            if session.get('role') != 'admin':
+                user_filter = "AND h.modifie_par = ?"
+                params.append(session['username'])
+
+            base_from = f"FROM historique h LEFT JOIN clients c ON h.client_id = c.id WHERE 1=1 {user_filter}"
+            where_clauses = []
+
+            if search_client:
+                where_clauses.append("AND c.nom LIKE ?")
+                params.append(f"%{search_client}%")
+
+            if action != 'tous':
+                where_clauses.append("AND h.action = ?")
+                params.append(action)
+
+            if date_debut:
+                where_clauses.append("AND h.date_modification >= ?")
+                params.append(date_debut)
+            if date_fin:
+                where_clauses.append("AND h.date_modification <= ?")
+                params.append(date_fin + 'T23:59:59')
+
+            where_sql = " ".join(where_clauses)
+            count_query = f"SELECT COUNT(*) {base_from} {where_sql}"
+            total = conn.execute(count_query, params).fetchone()[0]
+            total_pages = (total + per_page - 1) // per_page
+
+            query = f"SELECT h.*, c.nom as client_nom {base_from} {where_sql} ORDER BY h.date_modification DESC LIMIT ? OFFSET ?"
+            params_for_query = params + [per_page, (page - 1) * per_page]
+            actions = conn.execute(query, params_for_query).fetchall()
+            response = make_response(jsonify({
+                "actions": [dict(action) for action in actions],
+                "total_pages": total_pages
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /api/historique : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la récupération de l'historique."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/admin/users', methods=['GET', 'POST'])
+@login_required
+@admin_required
+@csrf.exempt  # AJOUTÉ : Exempt CSRF pour API POST (login_required protège)
+def manage_users():
+    try:
+        with get_db_connection() as conn:
+            if request.method == 'GET':
+                users = conn.execute("SELECT id, username, fullname, email, role FROM users").fetchall()
+                response = make_response(jsonify({"users": [dict(user) for user in users]}), 200)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+
+            elif request.method == 'POST':
+                data = request.get_json()
+                user_id = data.get('user_id')
+                new_role = data.get('role')
+
+                if new_role not in ['user', 'admin']:
+                    response = make_response(jsonify({"error": "Rôle invalide."}), 400)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+                if not user:
+                    response = make_response(jsonify({"error": "Utilisateur non trouvé."}), 404)
+                    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                    response.headers['Access-Control-Allow-Credentials'] = 'true'
+                    return response
+
+                old_role = user['role']
+                conn.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
+                conn.commit()
+                socketio.emit('notification', {
+                    'message': f"Rôle de {user['username']} changé de {old_role} à {new_role} par {session['username']}"
+                })
+                response = make_response(jsonify({"message": "Rôle mis à jour."}), 200)
+                response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+                response.headers['Access-Control-Allow-Credentials'] = 'true'
+                return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /admin/users : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la gestion des utilisateurs."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    
+@app.route('/admin/connexions', methods=['GET'])
+@login_required
+@admin_required
+def get_connexions():
+    try:
+        with get_db_connection() as conn:
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 10))
+            search_user = request.args.get('search_user', '')
+            action = request.args.get('action', 'tous')
+            date_debut = request.args.get('date_debut', '')
+            date_fin = request.args.get('date_fin', '')
+
+            base_from = "FROM connexions c JOIN users u ON c.user_id = u.id WHERE 1=1"
+            where_clauses = []
+            params = []
+
+            if search_user:
+                where_clauses.append("AND u.username LIKE ?")
+                params.append(f"%{search_user}%")
+
+            if action != 'tous':
+                where_clauses.append("AND c.action = ?")
+                params.append(action)
+
+            if date_debut:
+                where_clauses.append("AND c.date_action >= ?")
+                params.append(date_debut)
+            if date_fin:
+                where_clauses.append("AND c.date_action <= ?")
+                params.append(date_fin + 'T23:59:59')
+
+            where_sql = " ".join(where_clauses)
+            count_query = f"SELECT COUNT(*) {base_from} {where_sql}"
+            total = conn.execute(count_query, params).fetchone()[0]
+            total_pages = (total + per_page - 1) // per_page
+
+            query = f"SELECT c.*, u.username {base_from} {where_sql} ORDER BY c.date_action DESC LIMIT ? OFFSET ?"
+            params_for_query = params + [per_page, (page - 1) * per_page]
+            connexions = conn.execute(query, params_for_query).fetchall()
+            response = make_response(jsonify({
+                "connexions": [dict(connexion) for connexion in connexions],
+                "total_pages": total_pages
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /admin/connexions : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la récupération des connexions."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/api/stats', methods=['GET'])
+@login_required
+def get_stats():
+    try:
+        with get_db_connection() as conn:
+            today = date.today().isoformat()
+            
+            # AJOUTÉ : Filtre par created_by si non-admin
+            client_filter = ""
+            params = [today, today]
+            if session.get('role') != 'admin':
+                client_filter = "WHERE created_by = ?"
+                params = [session['username'], today, today]
+
+            montants = conn.execute(f"""
+                SELECT COALESCE(SUM(CASE WHEN date_echeance < ? THEN montant_du ELSE 0 END), 0) as retard,
+                       COALESCE(SUM(CASE WHEN date_echeance >= ? THEN montant_du ELSE 0 END), 0) as avenir
+                FROM clients {client_filter}
+            """, params).fetchone()
+
+            status_count = conn.execute(f"""
+                SELECT COUNT(CASE WHEN montant_du = 0 THEN 1 END) as payes,
+                       COUNT(CASE WHEN montant_du > 0 THEN 1 END) as en_retard,
+                       COUNT(*) as total
+                FROM clients {client_filter}
+            """, params[:1] if session.get('role') != 'admin' else []).fetchone()  # Params adaptés
+
+            total_du = conn.execute(f"SELECT COALESCE(SUM(montant_du), 0) as total FROM clients {client_filter}", params[:1] if session.get('role') != 'admin' else []).fetchone()
+
+            response = make_response(jsonify({
+                "montants_par_statut": {
+                    "retard": float(montants['retard']),
+                    "avenir": float(montants['avenir'])
+                },
+                "repartition_clients": {
+                    "payes": int(status_count['payes']),
+                    "en_retard": int(status_count['en_retard']),
+                    "total": int(status_count['total'])
+                },
+                "total_du": float(total_du['total'])
+            }), 200)
+            response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
+    except sqlite3.Error as e:
+        logging.error(f"Erreur SQLite dans /api/stats : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la récupération des statistiques."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/api/countries', methods=['GET'])
+def get_countries():
+    try:
+        response = make_response(jsonify(get_country_list()), 200)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+    except Exception as e:
+        logging.error(f"Erreur dans /api/countries : {str(e)}")
+        response = make_response(jsonify({"error": "Erreur serveur lors de la récupération des pays."}), 500)
+        response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
+
+@app.route('/')
+def index():
+    response = make_response(jsonify({"message": "Bienvenue dans l'API de gestion des clients."}), 200)
+    response.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
+
+# Initialisation DB
+def init_db():
+    try:
+        with get_db_connection() as conn:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                fullname TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                avatar_url TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nom TEXT NOT NULL,
+                telephone TEXT NOT NULL,
+                email TEXT NOT NULL,
+                montant_du REAL NOT NULL,
+                date_echeance TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS paiements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER,
+                montant REAL NOT NULL,
+                date_paiement TEXT NOT NULL,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+            );
+            
+            CREATE TABLE IF NOT EXISTS historique (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER,
+                action TEXT NOT NULL,
+                modifie_par TEXT NOT NULL,
+                date_modification TEXT NOT NULL,
+                details TEXT,
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+            );
+            
+            CREATE TABLE IF NOT EXISTS connexions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                date_action TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+                               
+            -- Table pour resets de mot de passe
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT NOT NULL UNIQUE,
+                code TEXT,  -- Pour SMS
+                expires_at TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            
+            -- Créer un admin par défaut si inexistant
+            INSERT OR IGNORE INTO users (username, fullname, email, password, role) 
+            VALUES ('admin', 'Administrateur', 'admin@example.com', 
+                    '$2b$12$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'admin');
+            """)
+            conn.commit()
+            
+            # Migration auto pour avatar_url si table existe mais colonne pas
+            try:
+                conn.execute("SELECT avatar_url FROM users LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT NULL")
+                conn.commit()
+                logging.info("Migration : Colonne avatar_url ajoutée.")
+            
+            # FIX Migration pour telephone : Ajoute colonne sans UNIQUE d'abord, puis INDEX si possible
+            try:
+                conn.execute("SELECT telephone FROM users LIMIT 1")
+                logging.info("Colonne telephone déjà présente.")
+            except sqlite3.OperationalError as e:
+                if "no such column: telephone" in str(e):
+                    # Étape 1: Ajoute colonne TEXT sans contrainte (toléré sur table non-vide)
+                    conn.execute("ALTER TABLE users ADD COLUMN telephone TEXT")
+                    conn.commit()
+                    logging.info("Migration : Colonne telephone ajoutée (sans UNIQUE initial).")
+                    
+                    # Étape 2: Ajoute INDEX UNIQUE (toléré si NULLs OK, UNIQUE permet un NULL)
+                    try:
+                        conn.execute("CREATE UNIQUE INDEX idx_users_telephone ON users(telephone)")
+                        conn.commit()
+                        logging.info("Migration : INDEX UNIQUE sur telephone ajouté.")
+                    except sqlite3.OperationalError as unique_e:
+                        if "index already exists" in str(unique_e):
+                            logging.info("INDEX UNIQUE sur telephone déjà présent.")
+                        else:
+                            logging.warning(f"Impossible d'ajouter INDEX UNIQUE sur telephone : {str(unique_e)}. Colonne ajoutée sans contrainte (ajoute manuellement si besoin).")
+                else:
+                    raise e  # Autre erreur SQLite
+            
+            # AJOUT : Log final pour confirmer
+            logging.info("Base de données initialisée avec succès. Colonne telephone vérifiée.")
+            logging.info("Admin par défaut créé - username: admin, password: password")
+    except sqlite3.Error as e:
+        logging.error(f"Erreur lors de l'initialisation de la base de données : {str(e)}")
+        raise
+
+if __name__ == '__main__':
+    init_db()
+    # lancer le scheduler en thread daemon (catch exceptions dans run_scheduler)
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    # démarrer socketio
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
